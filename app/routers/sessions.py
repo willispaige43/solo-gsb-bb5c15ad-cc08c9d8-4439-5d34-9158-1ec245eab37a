@@ -27,7 +27,8 @@ class CreateSessionBody(BaseModel):
 def _session_row(token: str):
     return get_conn().execute(
         """
-        SELECT s.token, s.scenario, s.state, s.context, s.created_at, s.updated_at
+        SELECT s.token, s.scenario, s.revision, s.state, s.context,
+               s.created_at, s.updated_at
         FROM sessions s WHERE s.token = ?
         """,
         (token,),
@@ -38,6 +39,7 @@ def _serialize(row) -> dict:
     return {
         "token": row["token"],
         "scenario": row["scenario"],
+        "revision": row["revision"],
         "state": row["state"],
         "context": json.loads(row["context"]),
         "created_at": row["created_at"],
@@ -62,10 +64,11 @@ async def create_session(body: CreateSessionBody) -> JSONResponse:
                 "detail": "存在多个场景，请在 body.scenario 中指定",
             })
 
-    scenario = store.get(scenario_name)
-    if scenario is None:
+    found = store.get_current(scenario_name)
+    if found is None:
         return JSONResponse(status_code=404, content={"error": "scenario_not_found",
                                               "scenario": scenario_name})
+    scenario, revision = found  # 绑定此刻的当前 revision，之后不再随发布变化
 
     state = body.state or scenario.initial_state
     if state not in scenario.states:
@@ -78,8 +81,9 @@ async def create_session(body: CreateSessionBody) -> JSONResponse:
     with write_tx() as conn:
         try:
             conn.execute(
-                "INSERT INTO sessions(token, scenario, state, context) VALUES (?, ?, ?, ?)",
-                (token, scenario_name, state, dumps(context)),
+                "INSERT INTO sessions(token, scenario, revision, state, context)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (token, scenario_name, revision, state, dumps(context)),
             )
         except sqlite3.IntegrityError:
             return JSONResponse(status_code=409, content={"error": "session_exists", "token": token})
@@ -94,7 +98,8 @@ async def get_session(token: str) -> JSONResponse:
     if row is None:
         return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
     result = _serialize(row)
-    scenario = store.get(row["scenario"])
+    # 可用状态与路由按会话绑定的 revision 给出，而非当前版本
+    scenario = store.get(row["scenario"], row["revision"])
     if scenario is not None:
         result["available_states"] = scenario.states
         result["routes"] = [
@@ -111,7 +116,7 @@ async def list_events(token: str, limit: int = 50) -> JSONResponse:
     limit = max(1, min(limit, 500))
     rows = get_conn().execute(
         """
-        SELECT id, method, path, route, rule, from_state, to_state,
+        SELECT id, revision, method, path, route, rule, from_state, to_state,
                status_code, created_at
         FROM events WHERE token = ? ORDER BY id DESC LIMIT ?
         """,
@@ -262,7 +267,8 @@ async def reset_session(token: str, body: ResetBody) -> JSONResponse:
     row = _session_row(token)
     if row is None:
         return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
-    scenario = store.get(row["scenario"])
+    # 重置不改变会话绑定的 revision：状态合法性按绑定版本校验
+    scenario = store.get(row["scenario"], row["revision"])
     if scenario is None:
         return JSONResponse(status_code=410, content={"error": "scenario_unloaded"})
 

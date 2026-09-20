@@ -18,15 +18,25 @@ from .config import settings
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenarios (
-    name        TEXT PRIMARY KEY,
+    name             TEXT PRIMARY KEY,
+    current_revision INTEGER,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS scenario_revisions (
+    scenario    TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
     definition  TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    PRIMARY KEY (scenario, revision),
+    FOREIGN KEY (scenario) REFERENCES scenarios(name)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
     token            TEXT PRIMARY KEY,
     scenario         TEXT NOT NULL,
+    revision         INTEGER,
     state            TEXT NOT NULL,
     context          TEXT NOT NULL,
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
@@ -38,6 +48,7 @@ CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY AUTOINCREMENT,
     token       TEXT NOT NULL,
     scenario    TEXT NOT NULL,
+    revision    INTEGER,
     method      TEXT NOT NULL,
     path        TEXT NOT NULL,
     route       TEXT,
@@ -86,7 +97,48 @@ def init_db() -> None:
         os.makedirs(directory, exist_ok=True)
     conn = get_conn()
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _column_names(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把 revision 化之前的旧库就地升级，已有数据全部保留。
+
+    - scenarios 增加 current_revision；旧定义原样固化为 revision 1 并置为当前版本；
+    - sessions 增加 revision，既有会话回填为其场景当时的当前版本（迁移后均为 1）；
+    - events 增加 revision（历史事件无法回溯版本，保留 NULL）。
+    """
+    scenario_cols = _column_names(conn, "scenarios")
+    if "current_revision" not in scenario_cols:
+        conn.execute("ALTER TABLE scenarios ADD COLUMN current_revision INTEGER")
+        if "definition" in scenario_cols:  # 旧表内联保存定义：迁移为不可变的 revision 1
+            for row in conn.execute("SELECT name, definition, created_at FROM scenarios"):
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO scenario_revisions(scenario, revision, definition, created_at)
+                    VALUES (?, 1, ?, ?)
+                    """,
+                    (row["name"], row["definition"], row["created_at"]),
+                )
+        conn.execute("UPDATE scenarios SET current_revision = 1 WHERE current_revision IS NULL")
+
+    if "revision" not in _column_names(conn, "sessions"):
+        conn.execute("ALTER TABLE sessions ADD COLUMN revision INTEGER")
+        conn.execute(
+            """
+            UPDATE sessions SET revision = (
+                SELECT current_revision FROM scenarios
+                WHERE scenarios.name = sessions.scenario
+            ) WHERE revision IS NULL
+            """
+        )
+
+    if "revision" not in _column_names(conn, "events"):
+        conn.execute("ALTER TABLE events ADD COLUMN revision INTEGER")
 
 
 class WriteLocked(sqlite3.OperationalError):

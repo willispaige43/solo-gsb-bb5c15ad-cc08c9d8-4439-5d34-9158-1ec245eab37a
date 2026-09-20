@@ -4,8 +4,12 @@
 YAML 场景，服务按**会话令牌**隔离每个调用方的当前状态，并在**单个 SQLite 写事务**中
 完成「选择最高优先级匹配 → 渲染响应 → 推进状态」，保证同一会话的并发请求不会重复触发同一条迁移。
 
+场景按**不可变版本（revision）**发布：每次 `PUT` 校验通过后产生递增 revision 并置为当前版本，
+旧版本定义保留不覆盖；会话在创建时绑定当时的当前 revision，之后无论场景再发布多少新版本，
+该会话的真实请求与预演都始终按绑定版本执行。
+
 - 技术栈：Python 3.12 · FastAPI · SQLite（WAL）· Jinja2 沙箱模板 · PyYAML
-- 容器内启动即自动完成依赖安装与数据库初始化，并自动加载 `scenarios/` 下的示例场景
+- 容器内启动即自动完成依赖安装与数据库初始化（含旧库就地升级），并自动加载 `scenarios/` 下的示例场景
 
 ---
 
@@ -67,6 +71,7 @@ curl -s "$BASE/__sessions/t1/events"
 每个模拟响应还带有调试响应头：
 
 - `X-Sim-Matched: order-flow:pay-order:pay-created`（场景:路由:规则）
+- `X-Sim-Revision: 1`（实际执行的场景 revision）
 - `X-Sim-State: created->paid`（迁移前后状态）
 
 ---
@@ -158,32 +163,64 @@ routes:
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | POST | `/__scenarios/validate` | 只校验不入库。body 为 YAML 文本（`Content-Type: application/yaml`）或 JSON |
-| GET | `/__scenarios` | 列出全部场景及解析后的结构 |
-| GET | `/__scenarios/{name}` | 查看单个场景摘要 |
-| GET | `/__scenarios/{name}/yaml` | 取回原始 YAML |
-| PUT | `/__scenarios/{name}` | **校验并载入**（新增或替换），替换对新会话立即生效 |
-| DELETE | `/__scenarios/{name}` | 删除；仍有会话引用时返回 409，加 `?force=true` 级联删除 |
+| GET | `/__scenarios` | 列出全部场景及解析后的结构（含 `current_revision` 与版本数 `revisions`） |
+| GET | `/__scenarios/{name}` | 查看单个场景摘要（当前版本） |
+| GET | `/__scenarios/{name}/yaml` | 取回原始 YAML；`?revision=N` 可取指定历史版本 |
+| PUT | `/__scenarios/{name}` | **校验并发布**：产生递增 revision 并置为当前版本；内容与当前版本完全相同时幂等返回原 revision |
+| GET | `/__scenarios/{name}/revisions` | **版本列表**：全部不可变 revision，标注当前版本 |
+| GET | `/__scenarios/{name}/revisions/{rev}` | 查看指定 revision 的解析结构 |
+| POST | `/__scenarios/{name}/revisions/{rev}/activate` | **激活**指定 revision 为当前版本（只影响之后新建的会话）；目标不存在返回 404 |
+| DELETE | `/__scenarios/{name}` | 删除场景及其全部版本；仍有会话引用时返回 409，加 `?force=true` 级联删除 |
 
 ```bash
 # 校验
 curl -s -X POST $BASE/__scenarios/validate \
   -H 'Content-Type: application/yaml' --data-binary @my-scenario.yaml
 
-# 载入（文件名/场景名任意，以 URL 中的 name 为准）
+# 发布（文件名/场景名任意，以 URL 中的 name 为准）
 curl -s -X PUT $BASE/__scenarios/my-scenario \
   -H 'Content-Type: application/yaml' --data-binary @my-scenario.yaml
+# -> {"loaded":true,"action":"created","revision":1,"current_revision":1,...}
+#    再次 PUT 修改后的定义 -> {"action":"published","revision":2,...}
+#    重复 PUT 与当前版本相同的内容 -> {"action":"unchanged","revision":2,...}（幂等，不产生新版本）
+```
+
+#### 场景版本（revision）与会话绑定
+
+- 每次 `PUT` 校验通过后，定义作为**新的不可变 revision** 落库并置为当前版本，
+  旧版本保留在 `scenario_revisions` 表中，永不覆盖；
+- **新会话**（显式 `POST /__sessions` 或首个业务请求懒创建）绑定**当时的当前
+  revision**，之后该会话的真实请求、单次预演与请求链预演都按该版本执行——
+  场景再发布新版本或激活旧版本都**不影响既有会话**；
+- **激活**只切换「新会话的默认版本」，用于回滚：把旧 revision 置为当前版本后，
+  只有之后新建的会话使用它；
+- 场景查询、会话查询、事件历史与模拟响应（`X-Sim-Revision` 头）都会暴露实际
+  revision；再次发布时 revision 始终取 `max+1`（激活过旧版本也不会回绕或覆盖）。
+
+```bash
+# 查看版本列表（current 标注新会话默认版本）
+curl -s $BASE/__scenarios/order-flow/revisions
+# -> {"name":"order-flow","current_revision":2,
+#     "revisions":[{"revision":1,"created_at":"...","current":false},
+#                  {"revision":2,"created_at":"...","current":true}]}
+
+# 回滚：激活 revision 1（只影响之后新建的会话）
+curl -s -X POST $BASE/__scenarios/order-flow/revisions/1/activate
+
+# 取回历史版本的原始 YAML
+curl -s "$BASE/__scenarios/order-flow/yaml?revision=1"
 ```
 
 ### 会话
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{}}`，字段均可省略 |
-| GET | `/__sessions/{token}` | **会话状态查询**：当前状态、上下文、可用状态、路由列表 |
-| GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧） |
-| POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异 |
+| POST | `/__sessions` | 显式创建会话：`{"token":"t1","scenario":"order-flow","state":"created","context":{}}`，字段均可省略；绑定**当前 revision** 并在响应中返回 |
+| GET | `/__sessions/{token}` | **会话状态查询**：当前状态、绑定的 `revision`、上下文、可用状态、路由列表（按绑定版本给出） |
+| GET | `/__sessions/{token}/events?limit=50` | 最近的匹配与状态迁移历史（新→旧，含每次命中时的 `revision`） |
+| POST | `/__sessions/{token}/preview` | **请求预演**：不落库地试运行一次业务请求，返回拟响应与 state/context 差异（按会话绑定的 revision 执行） |
 | POST | `/__sessions/{token}/preview/chain` | **连续请求链预演**：有序请求数组基于同一会话快照依次试跑（最多 50 步），逐步返回命中/拟响应/差异与最终快照，不落库 |
-| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件 |
+| POST | `/__sessions/{token}/reset` | 重置到初始（或指定）状态并清空事件；不改变会话绑定的 revision |
 | DELETE | `/__sessions/{token}` | 删除会话及其事件 |
 
 #### 请求预演（dry-run）
@@ -225,7 +262,8 @@ curl -s -X POST $BASE/__sessions/t1/preview \
 ```json
 {
   "preview": {"persisted": false},
-  "matched": {"scenario": "order-flow", "route": "pay-order",
+  "revision": 1,
+  "matched": {"scenario": "order-flow", "revision": 1, "route": "pay-order",
               "rule": "pay-created", "path_params": {"order_id": "42"}},
   "response": {
     "status_code": 200,
@@ -312,6 +350,7 @@ curl -s -X POST $BASE/__sessions/c1/preview/chain \
   "preview": {"persisted": false, "chain": true},
   "token": "c1",
   "scenario": "order-flow",
+  "revision": 1,
   "steps_completed": 4,
   "steps_total": 4,
   "stopped": false,
@@ -430,15 +469,15 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 ├── app/
 │   ├── main.py            # FastAPI 入口、生命周期初始化、全路径转发
 │   ├── config.py          # 环境变量配置
-│   ├── db.py              # 连接/WAL/建表/IMMEDIATE 写事务（含只读回滚事务）与锁重试
+│   ├── db.py              # 连接/WAL/建表/旧库迁移/IMMEDIATE 写事务（含只读回滚事务）与锁重试
 │   ├── scenario.py        # YAML 解析与校验
 │   ├── models.py          # 场景/路由/规则数据模型
 │   ├── matching.py        # 路径模式、点路径取值、条件运算符
 │   ├── renderer.py        # Jinja2 沙箱渲染与模板函数
 │   ├── engine.py          # 核心：单事务匹配→渲染→迁移；同快照只读单请求/请求链预演（零副作用）
-│   ├── store.py           # 已编译场景缓存
+│   ├── store.py           # 已编译场景缓存（按 name+revision）、发布/激活
 │   └── routers/
-│       ├── scenarios.py   # 场景校验/载入/查询/删除
+│       ├── scenarios.py   # 场景校验/版本发布/版本列表/激活/查询/删除
 │       └── sessions.py    # 会话创建/状态查询/重置/事件/单请求与请求链预演
 ├── scenarios/
 │   └── order-flow.yaml    # 示例场景（随启动自动加载）
@@ -448,8 +487,11 @@ SIM_SCENARIOS_DIR=/app/scenarios docker compose run --rm \
 └── README.md
 ```
 
-数据库表：`scenarios`（场景定义）、`sessions`（令牌 → 场景/状态/上下文）、
-`events`（每次命中的路由、规则、前后状态与状态码）。
+数据库表：`scenarios`（场景名 → 当前 revision）、`scenario_revisions`（不可变的
+场景定义版本，`(scenario, revision)` 主键）、`sessions`（令牌 → 场景/绑定
+revision/状态/上下文）、`events`（每次命中的 revision、路由、规则、前后状态与
+状态码）。启动时自动检测并就地升级旧版表结构：旧定义固化为 revision 1，
+既有会话回填绑定该版本，历史事件的 revision 置空。
 
 ---
 

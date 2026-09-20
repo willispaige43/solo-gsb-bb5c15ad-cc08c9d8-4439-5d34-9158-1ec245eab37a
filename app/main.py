@@ -10,22 +10,24 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 
 from .config import settings
-from .db import get_conn, init_db
+from .db import init_db
 from .engine import SimAbort, SimResult, simulate
 from .routers import scenarios, sessions
-from .scenario import parse_scenario
 from .store import store
 
 logger = logging.getLogger("simulator")
 
 
 def _autoload_scenarios() -> None:
-    """从目录批量载入 *.yaml/*.yml（文件名即场景名）。"""
+    """从目录批量载入 *.yaml/*.yml（文件名即场景名）。
+
+    与 PUT 走同一条发布路径：内容有变化时产生新 revision 并置为当前版本，
+    内容未变时幂等跳过（重启不会累积无用版本）。
+    """
     directory = settings.autoload_dir
     if not directory or not os.path.isdir(directory):
         return
     loaded = 0
-    conn = get_conn()
     for filename in sorted(os.listdir(directory)):
         if not (filename.endswith(".yaml") or filename.endswith(".yml")):
             continue
@@ -33,19 +35,10 @@ def _autoload_scenarios() -> None:
         path = os.path.join(directory, filename)
         with open(path, encoding="utf-8") as fh:
             text = fh.read()
-        scenario = parse_scenario(text)  # 校验，失败则启动失败、暴露问题
-        conn.execute(
-            """
-            INSERT INTO scenarios(name, definition, created_at, updated_at)
-            VALUES (?, ?, datetime('now'), datetime('now'))
-            ON CONFLICT(name) DO UPDATE SET
-                definition = excluded.definition,
-                updated_at = datetime('now')
-            """,
-            (scenario.name, text),
-        )
+        _, revision, action = store.publish(name, text)  # 校验失败则启动失败、暴露问题
+        if action != "unchanged":
+            logger.info("场景 %s 已发布为 revision %d（%s）", name, revision, action)
         loaded += 1
-    conn.commit()
     if loaded:
         logger.info("自动载入 %d 个场景: %s", loaded, directory)
 
@@ -57,7 +50,6 @@ async def lifespan(app: FastAPI):
     init_db()
     store.load_all_from_db()
     _autoload_scenarios()
-    store.load_all_from_db()
     logger.info("就绪，已加载场景: %s", store.names() or "<无>")
     yield
 
@@ -95,6 +87,7 @@ def _build_response(result: SimResult):
     response.headers["X-Sim-Matched"] = (
         f"{result.matched['scenario']}:{result.matched['route']}:{result.matched['rule']}"
     )
+    response.headers["X-Sim-Revision"] = str(result.matched["revision"])
     response.headers["X-Sim-State"] = (
         f"{result.matched['from_state']}->{result.matched['to_state']}"
     )
