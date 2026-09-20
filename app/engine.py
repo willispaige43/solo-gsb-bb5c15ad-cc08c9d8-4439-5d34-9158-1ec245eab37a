@@ -299,22 +299,35 @@ def _plan_matched(scenario: Scenario, scenario_name: str, route: Route,
 
 def _resolve_snapshot(conn, token: str, explicit_scenario: str | None,
                       default_scenario: str | None) -> tuple[
-                          Scenario, str, str, dict[str, Any], bool]:
-    """解析会话快照；不存在时按真实请求的规则懒创建（仅真实写路径会落库）。"""
+                          Scenario, str, int, str, dict[str, Any], bool]:
+    """解析会话快照；不存在时按真实请求的规则懒创建（仅真实写路径会落库）。
+
+    既有会话始终按其绑定的 revision 编译结果执行；新会话绑定**当前时刻**
+    的当前 revision（在同一写事务内读取，与并发发布串行化）。
+    """
     row = conn.execute(
-        "SELECT scenario, state, context FROM sessions WHERE token = ?",
+        "SELECT scenario, revision, state, context FROM sessions WHERE token = ?",
         (token,),
     ).fetchone()
 
     if row is not None:
         scenario_name = row["scenario"]
-        scenario = store.get(scenario_name)
+        revision = row["revision"]
+        scenario = store.get_revision(scenario_name, revision)
         if scenario is None:
-            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
-        return scenario, scenario_name, row["state"], json.loads(row["context"]), False
+            raise SimAbort(410, {"error": "scenario_unloaded",
+                                 "scenario": scenario_name, "revision": revision})
+        return scenario, scenario_name, revision, row["state"], json.loads(row["context"]), False
 
     scenario = _select_scenario(explicit_scenario, default_scenario)
-    return scenario, scenario.name, scenario.initial_state, {}, True
+    revision = conn.execute(
+        "SELECT current_revision FROM scenarios WHERE name = ?",
+        (scenario.name,),
+    ).fetchone()["current_revision"]
+    bound = store.get_revision(scenario.name, revision)
+    if bound is not None:
+        scenario = bound
+    return scenario, scenario.name, revision, scenario.initial_state, {}, True
 
 
 # ---------------------------------------------------------------------------
@@ -344,19 +357,20 @@ async def simulate(request, default_scenario: str | None = None) -> SimResult:
 
 def _run_locked(conn, token, method, path, query, headers, body,
                 default_scenario, explicit_scenario) -> SimResult:
-    # 1) 查找会话与场景（不存在则按懒创建规则选场景，暂不落库）
-    scenario, scenario_name, state, context, is_new_session = _resolve_snapshot(
-        conn, token, explicit_scenario, default_scenario)
+    # 1) 查找会话与场景（不存在则按懒创建规则选场景并绑定当前 revision，暂不落库）
+    scenario, scenario_name, revision, state, context, is_new_session = \
+        _resolve_snapshot(conn, token, explicit_scenario, default_scenario)
 
     # 2) 匹配路由（不存在则回滚，不留下空会话）
     route, path_params, _trace = _match_routes(scenario, method, path)
 
-    # 3) 新会话落库
+    # 3) 新会话落库（绑定当时的当前 revision，之后不再随发布变化）
     if is_new_session:
         try:
             conn.execute(
-                "INSERT INTO sessions(token, scenario, state, context) VALUES (?, ?, ?, ?)",
-                (token, scenario_name, state, dumps(context)),
+                "INSERT INTO sessions(token, scenario, revision, state, context)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (token, scenario_name, revision, state, dumps(context)),
             )
         except sqlite3.IntegrityError:
             # 并发首请求：另一事务已插入，转为锁冲突重试
@@ -403,6 +417,7 @@ def _run_locked(conn, token, method, path, query, headers, body,
         is_json=planned.is_json,
         matched={
             "scenario": scenario_name,
+            "revision": revision,
             "route": route.id,
             "rule": rule.name,
             "from_state": state,
@@ -533,7 +548,7 @@ def preview_session(token: str, method: str, path: str, query: dict[str, Any],
     """
     with read_tx() as conn:
         row = conn.execute(
-            "SELECT scenario, state, context FROM sessions WHERE token = ?",
+            "SELECT scenario, revision, state, context FROM sessions WHERE token = ?",
             (token,),
         ).fetchone()
         if row is None:
@@ -543,9 +558,11 @@ def preview_session(token: str, method: str, path: str, query: dict[str, Any],
                          "preview": {"persisted": False}}
 
         scenario_name = row["scenario"]
-        scenario = store.get(scenario_name)
+        revision = row["revision"]
+        scenario = store.get_revision(scenario_name, revision)
         if scenario is None:
-            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
+            raise SimAbort(410, {"error": "scenario_unloaded",
+                                 "scenario": scenario_name, "revision": revision})
         state = row["state"]
         context = json.loads(row["context"])
 
@@ -554,7 +571,8 @@ def preview_session(token: str, method: str, path: str, query: dict[str, Any],
             method=method, path=path, query=query, headers=headers, body=body)
 
     # 事务已回滚：以下全部是基于快照的拟结果
-    payload = {"preview": {"persisted": False}, "token": token, **step}
+    payload = {"preview": {"persisted": False}, "token": token,
+               "scenario": scenario_name, "revision": revision, **step}
     return 200, payload
 
 
@@ -571,7 +589,7 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
     """
     with read_tx() as conn:
         row = conn.execute(
-            "SELECT scenario, state, context FROM sessions WHERE token = ?",
+            "SELECT scenario, revision, state, context FROM sessions WHERE token = ?",
             (token,),
         ).fetchone()
         if row is None:
@@ -582,9 +600,11 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
             }
 
         scenario_name = row["scenario"]
-        scenario = store.get(scenario_name)
+        revision = row["revision"]
+        scenario = store.get_revision(scenario_name, revision)
         if scenario is None:
-            raise SimAbort(410, {"error": "scenario_unloaded", "scenario": scenario_name})
+            raise SimAbort(410, {"error": "scenario_unloaded",
+                                 "scenario": scenario_name, "revision": revision})
         initial_state = row["state"]
         initial_context = json.loads(row["context"])
 
@@ -637,6 +657,7 @@ def preview_chain(token: str, requests: list[dict[str, Any]]) -> tuple[int, dict
             "preview": {"persisted": False, "chain": True},
             "token": token,
             "scenario": scenario_name,
+            "revision": revision,
             "steps_completed": len(steps),
             "steps_total": len(requests),
             "stopped": failure is not None,

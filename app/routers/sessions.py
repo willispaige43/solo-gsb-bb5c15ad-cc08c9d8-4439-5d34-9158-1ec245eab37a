@@ -27,7 +27,8 @@ class CreateSessionBody(BaseModel):
 def _session_row(token: str):
     return get_conn().execute(
         """
-        SELECT s.token, s.scenario, s.state, s.context, s.created_at, s.updated_at
+        SELECT s.token, s.scenario, s.revision, s.state, s.context,
+               s.created_at, s.updated_at
         FROM sessions s WHERE s.token = ?
         """,
         (token,),
@@ -38,6 +39,7 @@ def _serialize(row) -> dict:
     return {
         "token": row["token"],
         "scenario": row["scenario"],
+        "revision": row["revision"],
         "state": row["state"],
         "context": json.loads(row["context"]),
         "created_at": row["created_at"],
@@ -62,24 +64,34 @@ async def create_session(body: CreateSessionBody) -> JSONResponse:
                 "detail": "存在多个场景，请在 body.scenario 中指定",
             })
 
-    scenario = store.get(scenario_name)
-    if scenario is None:
-        return JSONResponse(status_code=404, content={"error": "scenario_not_found",
-                                              "scenario": scenario_name})
-
-    state = body.state or scenario.initial_state
-    if state not in scenario.states:
-        return JSONResponse(status_code=422, content={"error": "unknown_state",
-                                              "state": state, "states": scenario.states})
-
-    context = dict(body.context)
-    context.setdefault("_seq", {})
-
     with write_tx() as conn:
+        # 绑定创建时刻的当前 revision（与并发发布在同一写事务下串行化）
+        current = conn.execute(
+            "SELECT current_revision FROM scenarios WHERE name = ?",
+            (scenario_name,),
+        ).fetchone()
+        if current is None:
+            return JSONResponse(status_code=404, content={"error": "scenario_not_found",
+                                                  "scenario": scenario_name})
+        revision = current["current_revision"]
+        scenario = store.get_revision(scenario_name, revision)
+        if scenario is None:
+            return JSONResponse(status_code=410, content={"error": "scenario_unloaded",
+                                                  "scenario": scenario_name})
+
+        state = body.state or scenario.initial_state
+        if state not in scenario.states:
+            return JSONResponse(status_code=422, content={"error": "unknown_state",
+                                                  "state": state, "states": scenario.states})
+
+        context = dict(body.context)
+        context.setdefault("_seq", {})
+
         try:
             conn.execute(
-                "INSERT INTO sessions(token, scenario, state, context) VALUES (?, ?, ?, ?)",
-                (token, scenario_name, state, dumps(context)),
+                "INSERT INTO sessions(token, scenario, revision, state, context)"
+                " VALUES (?, ?, ?, ?, ?)",
+                (token, scenario_name, revision, state, dumps(context)),
             )
         except sqlite3.IntegrityError:
             return JSONResponse(status_code=409, content={"error": "session_exists", "token": token})
@@ -94,7 +106,8 @@ async def get_session(token: str) -> JSONResponse:
     if row is None:
         return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
     result = _serialize(row)
-    scenario = store.get(row["scenario"])
+    # 可用状态与路由按会话绑定的 revision 展示，与其实际执行版本一致
+    scenario = store.get_revision(row["scenario"], row["revision"])
     if scenario is not None:
         result["available_states"] = scenario.states
         result["routes"] = [
@@ -262,7 +275,8 @@ async def reset_session(token: str, body: ResetBody) -> JSONResponse:
     row = _session_row(token)
     if row is None:
         return JSONResponse(status_code=404, content={"error": "session_not_found", "token": token})
-    scenario = store.get(row["scenario"])
+    # 状态校验基于会话绑定的 revision，场景重新发布不影响既有会话
+    scenario = store.get_revision(row["scenario"], row["revision"])
     if scenario is None:
         return JSONResponse(status_code=410, content={"error": "scenario_unloaded"})
 

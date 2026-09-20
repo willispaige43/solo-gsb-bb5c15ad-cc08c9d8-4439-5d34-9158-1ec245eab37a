@@ -1,4 +1,4 @@
-"""管理接口：场景校验 / 载入 / 查询 / 删除。"""
+"""管理接口：场景校验 / 版本化发布 / 查询 / 版本列表 / 激活 / 删除。"""
 from __future__ import annotations
 
 from typing import Any
@@ -68,12 +68,14 @@ async def validate_scenario(request: Request) -> JSONResponse:
 async def list_scenarios() -> JSONResponse:
     conn = get_conn()
     rows = conn.execute(
-        "SELECT name, created_at, updated_at FROM scenarios ORDER BY name"
+        "SELECT name, current_revision, created_at, updated_at"
+        " FROM scenarios ORDER BY name"
     ).fetchall()
     return JSONResponse({
         "scenarios": [
-            {"name": r["name"], "created_at": r["created_at"],
-             "updated_at": r["updated_at"], **_summary(store.get(r["name"]))}
+            {"name": r["name"], "current_revision": r["current_revision"],
+             "created_at": r["created_at"], "updated_at": r["updated_at"],
+             **_summary(store.get(r["name"]))}
             for r in rows
         ]
     })
@@ -83,13 +85,15 @@ async def list_scenarios() -> JSONResponse:
 async def get_scenario(name: str) -> JSONResponse:
     conn = get_conn()
     row = conn.execute(
-        "SELECT name, definition, created_at, updated_at FROM scenarios WHERE name = ?",
+        "SELECT name, current_revision, created_at, updated_at"
+        " FROM scenarios WHERE name = ?",
         (name,),
     ).fetchone()
     if row is None:
         return JSONResponse(status_code=404, content={"error": "scenario_not_found", "name": name})
     return JSONResponse({
         "name": row["name"],
+        "current_revision": row["current_revision"],
         "created_at": row["created_at"],
         "updated_at": row["updated_at"],
         "scenario": _summary(store.get(name)),
@@ -97,9 +101,24 @@ async def get_scenario(name: str) -> JSONResponse:
 
 
 @router.get("/{name}/yaml", response_class=PlainTextResponse)
-async def get_scenario_yaml(name: str) -> PlainTextResponse:
+async def get_scenario_yaml(name: str, revision: int | None = None) -> PlainTextResponse:
+    """取回原始 YAML；默认当前版本，可用 ?revision=N 取指定历史版本。"""
     conn = get_conn()
-    row = conn.execute("SELECT definition FROM scenarios WHERE name = ?", (name,)).fetchone()
+    if revision is None:
+        row = conn.execute(
+            """
+            SELECT r.definition FROM scenarios s
+            JOIN scenario_revisions r
+              ON r.name = s.name AND r.revision = s.current_revision
+            WHERE s.name = ?
+            """,
+            (name,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT definition FROM scenario_revisions WHERE name = ? AND revision = ?",
+            (name, revision),
+        ).fetchone()
     if row is None:
         return PlainTextResponse(
             f'{{"error":"scenario_not_found","name":"{name}"}}',
@@ -109,20 +128,68 @@ async def get_scenario_yaml(name: str) -> PlainTextResponse:
     return PlainTextResponse(row["definition"], media_type="application/yaml")
 
 
+@router.get("/{name}/revisions")
+async def list_revisions(name: str) -> JSONResponse:
+    """版本列表：全部不可变 revision 及当前指针。"""
+    conn = get_conn()
+    scenario = conn.execute(
+        "SELECT current_revision FROM scenarios WHERE name = ?", (name,)
+    ).fetchone()
+    if scenario is None:
+        return JSONResponse(status_code=404, content={"error": "scenario_not_found", "name": name})
+    rows = conn.execute(
+        "SELECT revision, created_at FROM scenario_revisions"
+        " WHERE name = ? ORDER BY revision",
+        (name,),
+    ).fetchall()
+    current = scenario["current_revision"]
+    return JSONResponse({
+        "name": name,
+        "current_revision": current,
+        "revisions": [
+            {"revision": r["revision"], "created_at": r["created_at"],
+             "is_current": r["revision"] == current}
+            for r in rows
+        ],
+    })
+
+
+@router.post("/{name}/revisions/{revision}/activate")
+async def activate_revision(name: str, revision: int) -> JSONResponse:
+    """把指定 revision 设为当前版本；只影响此后新建会话的绑定，既有会话不变。"""
+    if not store.activate(name, revision):
+        return JSONResponse(status_code=404, content={
+            "error": "revision_not_found", "name": name, "revision": revision,
+        })
+    return JSONResponse({
+        "activated": True,
+        "name": name,
+        "current_revision": revision,
+        "detail": "仅切换新会话的默认版本；既有会话仍按各自绑定的 revision 执行",
+    })
+
+
 @router.put("/{name}")
 async def upsert_scenario(name: str, request: Request) -> JSONResponse:
-    """校验并载入（新增或替换）场景。"""
+    """校验并发布新版本（不可变）；内容与当前版本相同时幂等返回原 revision。"""
     text = await _read_definition(request)
-    existed = store.get(name) is not None
     try:
-        scenario = store.upsert(name, text)
+        scenario, revision, created = store.publish(name, text)
     except ScenarioError as exc:
         return JSONResponse(status_code=422, content={"valid": False, "error": str(exc)})
     except yaml.YAMLError as exc:
         return JSONResponse(status_code=422, content={"valid": False, "error": f"YAML 解析失败: {exc}"})
+    if not created:
+        action = "unchanged"
+    elif revision == 1:
+        action = "created"
+    else:
+        action = "published"
     return JSONResponse({
         "loaded": True,
-        "action": "replaced" if existed else "created",
+        "action": action,
+        "revision": revision,
+        "current_revision": revision,
         "scenario": _summary(scenario),
     })
 

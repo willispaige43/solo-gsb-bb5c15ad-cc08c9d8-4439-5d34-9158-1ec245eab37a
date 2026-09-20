@@ -18,15 +18,25 @@ from .config import settings
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS scenarios (
-    name        TEXT PRIMARY KEY,
+    name             TEXT PRIMARY KEY,
+    current_revision INTEGER NOT NULL,
+    created_at       TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at       TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS scenario_revisions (
+    name        TEXT NOT NULL,
+    revision    INTEGER NOT NULL,
     definition  TEXT NOT NULL,
     created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-    updated_at  TEXT NOT NULL DEFAULT (datetime('now'))
+    PRIMARY KEY (name, revision),
+    FOREIGN KEY (name) REFERENCES scenarios(name)
 );
 
 CREATE TABLE IF NOT EXISTS sessions (
     token            TEXT PRIMARY KEY,
     scenario         TEXT NOT NULL,
+    revision         INTEGER NOT NULL,
     state            TEXT NOT NULL,
     context          TEXT NOT NULL,
     created_at       TEXT NOT NULL DEFAULT (datetime('now')),
@@ -86,7 +96,45 @@ def init_db() -> None:
         os.makedirs(directory, exist_ok=True)
     conn = get_conn()
     conn.executescript(SCHEMA)
+    _migrate(conn)
     conn.commit()
+
+
+def _columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in conn.execute(f"PRAGMA table_info({table})")}
+
+
+def _migrate(conn: sqlite3.Connection) -> None:
+    """把旧版（单定义覆盖式）库结构升级到不可变版本结构，可重复执行。
+
+    - 旧 ``scenarios`` 表携带 ``definition`` 列：把每份定义原样迁入
+      ``scenario_revisions`` 作为 revision 1，并设为当前版本；
+    - 旧 ``sessions`` 表缺少 ``revision`` 列：补列后绑定到所属场景的
+      当前版本（迁移时即 revision 1），既有会话行为保持不变。
+    """
+    if "definition" in _columns(conn, "scenarios"):
+        conn.execute(
+            """
+            INSERT OR IGNORE INTO scenario_revisions(name, revision, definition, created_at)
+            SELECT name, 1, definition, created_at FROM scenarios
+            """
+        )
+        conn.execute(
+            "ALTER TABLE scenarios ADD COLUMN current_revision INTEGER NOT NULL DEFAULT 1"
+        )
+        conn.execute("ALTER TABLE scenarios DROP COLUMN definition")
+
+    if "revision" not in _columns(conn, "sessions"):
+        conn.execute(
+            "ALTER TABLE sessions ADD COLUMN revision INTEGER NOT NULL DEFAULT 1"
+        )
+        conn.execute(
+            """
+            UPDATE sessions SET revision = COALESCE(
+                (SELECT current_revision FROM scenarios
+                 WHERE scenarios.name = sessions.scenario), 1)
+            """
+        )
 
 
 class WriteLocked(sqlite3.OperationalError):
